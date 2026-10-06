@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# compose [OPTIONS] COMMAND [ARGS...]
+#
+# docker compose for the repository of the current directory and its
+# dependencies: each from its image, and the repositories on the topic here
+# from their working trees, built in the toolchain container. Every argument
+# from COMMAND on goes to docker compose.
+#
+# Options, before COMMAND:
+#   --build DIR       run DIR from its working tree, though not on the topic
+#   --image DIR       run DIR from its image, though on the topic
+#   --network NAME    run the stack on the existing network NAME
+#   --committed       hash what is committed, leaving changes out
+#   --allow-released  give a repository lacking a topic change its release
+set -euo pipefail
+here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+# shellcheck source=./lib.sh
+. "$here/lib.sh"
+
+usage() {
+    sed -n '2,15s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"
+}
+
+top_of() {
+    git -C "$1" rev-parse --show-toplevel 2>/dev/null || die "$1 is not in a repository"
+}
+
+builds=()
+images=()
+network=""
+tag_options=()
+while (($#)); do
+    case $1 in
+    --build)
+        builds+=("$(top_of "${2:?--build needs a DIR}")")
+        shift 2
+        ;;
+    --image)
+        images+=("$(top_of "${2:?--image needs a DIR}")")
+        shift 2
+        ;;
+    --network)
+        network=${2:?--network needs a NAME}
+        shift 2
+        ;;
+    --committed | --allow-released)
+        tag_options+=("$1")
+        shift
+        ;;
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    *) break ;;
+    esac
+done
+(($#)) || {
+    usage >&2
+    exit 2
+}
+
+contains() {
+    local item=$1
+    shift
+    local each
+    for each in "$@"; do
+        [ "$each" = "$item" ] && return 0
+    done
+    return 1
+}
+
+# The repository, the workspace around it, and the stack: the repository and
+# its dependencies, recursively, each once.
+repo=$(top_of .)
+ws=$(workspace_of "$repo")
+rel=$(realpath --relative-to="$ws" "$repo")
+ls_json=$(workspace_ls "$ws")
+topic=$(topic_of "$ls_json")
+if [ "$rel" = . ]; then
+    hashed=$(git -C "$ws" scale hash --format json --committed)
+else
+    hashed=$(git -C "$ws" scale hash --format json --committed "$rel")
+fi
+
+stack=()
+seen=()
+from_tree=()
+from_image=()
+while IFS= read -r dir; do
+    abs=$(realpath "$ws/$dir")
+    contains "$abs" "${seen[@]}" && continue
+    seen+=("$abs")
+    stack+=("$abs")
+    export "GITSCALE_DEMO_$(name_of "$abs")_DIR=$abs"
+    [ -f "$abs/docker-compose.yml" ] || continue
+    on_topic=false
+    if [ "$dir" = . ]; then
+        [ -z "$topic" ] || on_topic=true
+    elif [ "$(jq -r --arg d "$dir" 'map(select(.directory == $d))[0].topic != null' <<<"$ls_json")" = true ]; then
+        on_topic=true
+    fi
+    if contains "$abs" "${builds[@]}" ||
+        { $on_topic && ! contains "$abs" "${images[@]}"; }; then
+        from_tree+=("$abs")
+    else
+        from_image+=("$abs")
+    fi
+done < <(jq -r '.[0].sources[] | .directory // "."' <<<"$hashed")
+
+# Tags for the images; the ones built from their working trees get none,
+# their image replaced below.
+if ((${#from_image[@]})); then
+    tags=$("$here/tags" "${tag_options[@]}" "${from_image[@]}") || exit 1
+    while IFS= read -r line; do
+        export "${line?}"
+    done <<<"$tags"
+fi
+for abs in "${from_tree[@]}"; do
+    export "GITSCALE_DEMO_$(name_of "$abs")_TAG=build"
+done
+
+# The toolchain, tagged by what is in toolchain/, built on first use.
+toolchain="gitscale-demo-toolchain:$(cd "$here/toolchain" && find . -type f -print0 |
+    sort -z | xargs -0 sha256sum | sha256sum | cut -c1-12)"
+if ((${#from_tree[@]})) || [ "$1" = run ]; then
+    docker image inspect "$toolchain" >/dev/null 2>&1 ||
+        docker build --quiet --tag "$toolchain" "$here/toolchain" >/dev/null
+fi
+
+# The override: how each service of a repository on the topic runs from its
+# working tree. Compose merges the rest — name, ports, env_file, depends_on —
+# from the repository's own file.
+user="$(id -u):$(id -g)"
+volumes=$(jq -cn --arg ws "$ws" --arg home "$HOME" '
+    [$ws, $home] | unique | map("\(.):\(.)")
+    + ["/etc/passwd:/etc/passwd:ro", "/etc/group:/etc/group:ro"]')
+services=$(jq -cn --arg image "$toolchain" --arg user "$user" --arg cwd "$PWD" \
+    --arg home "$HOME" --argjson volumes "$volumes" '
+    {shell: {image: $image, pull_policy: "never", profiles: ["shell"],
+             user: $user, working_dir: $cwd, entrypoint: [], command: ["bash"],
+             stdin_open: true, tty: true, volumes: $volumes,
+             environment: {HOME: $home, CARGO_HOME: "\($home)/.cargo"}}}')
+for abs in "${from_tree[@]}"; do
+    build=$(docker compose -f "$abs/docker-compose.yml" config --format json |
+        jq -c '."x-build" // {}')
+    services=$(jq -c --argjson build "$build" --arg image "$toolchain" --arg user "$user" \
+        --arg dir "$abs" --arg home "$HOME" --argjson volumes "$volumes" '
+        . + ($build | with_entries(.value |= (
+            {image: $image, pull_policy: "never", user: $user, working_dir: $dir,
+             entrypoint: [], command: ["bash", "-c", .run], restart: "no",
+             volumes: $volumes,
+             environment: ((.environment // {}) + {
+                 HOME: $home, CARGO_HOME: "\($home)/.cargo",
+                 CARGO_TARGET_DIR: "target/compose"})}
+            + (if .resources then {deploy: {resources: {limits: .resources}}} else {} end))))
+        ' <<<"$services")
+done
+override="$(git -C "$repo" rev-parse --absolute-git-dir)/gitscale-demo-compose.yml"
+jq -n --argjson services "$services" --arg network "$network" '
+    {services: $services}
+    + (if $network != "" then {networks: {default: {name: $network, external: true}}} else {} end)
+    ' >"$override"
+
+files=()
+for abs in "${stack[@]}"; do
+    [ ! -f "$abs/docker-compose.yml" ] || files+=(-f "$abs/docker-compose.yml")
+done
+files+=(-f "$override")
+project=$(basename "$ws" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_\n-' '-')
+exec docker compose -p "$project" --project-directory "$ws" "${files[@]}" "$@"

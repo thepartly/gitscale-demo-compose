@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# tags [--committed] [--allow-released] DIR...
+#
+# The image tag each repository runs with, one line each:
+#
+#   GITSCALE_DEMO_<NAME>_TAG=<tag>
+#
+# and for one --allow-released gave its release instead:
+#
+#   GITSCALE_DEMO_<NAME>_LACKS=<checkout>@<topic>
+#
+# On a pinned branch, a repository's resolved release. On a topic, its source
+# hash: the image its own pipeline built of exactly these sources. A
+# repository not on the topic, whose dependency is on it with changes, has no
+# image with them: that fails, unless --allow-released.
+set -euo pipefail
+here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+# shellcheck source=./lib.sh
+. "$here/lib.sh"
+
+usage() {
+    sed -n '2,15s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"
+}
+
+committed=()
+allow_released=false
+dirs=()
+while (($#)); do
+    case $1 in
+    --committed) committed=(--committed) ;;
+    --allow-released) allow_released=true ;;
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    -*) die "unknown option $1" ;;
+    *) dirs+=("$1") ;;
+    esac
+    shift
+done
+((${#dirs[@]})) || {
+    usage >&2
+    exit 2
+}
+
+ws=$(workspace_of .)
+ls_json=$(workspace_ls "$ws")
+topic=$(topic_of "$ls_json")
+
+failed=0
+for dir in "${dirs[@]}"; do
+    abs=$(git -C "$dir" rev-parse --show-toplevel)
+    rel=$(realpath --relative-to="$ws" "$abs")
+    name=$(name_of "$abs")
+    label=$rel
+    [ "$rel" != . ] || label=$(basename "$ws")
+    entry=$(jq -c --arg d "$rel" 'map(select(.directory == $d))[0] // {}' <<<"$ls_json")
+    if [ "$rel" = . ]; then
+        release=$(git -C "$abs" tag --points-at HEAD 'v[0-9]*-*' | head -n1)
+    else
+        release=$(jq -r '.resolved_ref // empty' <<<"$entry")
+    fi
+
+    if [ -z "$topic" ] && [[ $release =~ ^v[0-9]+- ]]; then
+        printf 'GITSCALE_DEMO_%s_TAG=%s\n' "$name" "$release"
+        continue
+    fi
+
+    if ((${#committed[@]} == 0)) &&
+        [ -n "$(git -C "$abs" status --porcelain --untracked-files=no)" ]; then
+        printf '%s has uncommitted changes; commit them, run it with --build, or --committed\n' \
+            "$label" >&2
+        failed=1
+        continue
+    fi
+    if [ "$rel" = . ]; then
+        hashed=$(git -C "$ws" scale hash --format json "${committed[@]}")
+    else
+        hashed=$(git -C "$ws" scale hash --format json "${committed[@]}" "$rel")
+    fi
+
+    # Off the topic itself, a dependency on it carrying a change — commits
+    # its pin has not — is one its image lacks, when its own build took
+    # another commit. A dependency at another pinned version is no change.
+    lacks=""
+    if [ "$rel" != . ] && [ "$(jq -r '.topic == null' <<<"$entry")" = true ]; then
+        lacks=$(jq -nr --argjson ls "$ls_json" --argjson h "$hashed" --arg self "$rel" '
+            $h[0].sources[]
+            | select(.directory != null and .directory != $self) as $s
+            | ($ls | map(select(.directory == $s.directory))[0]) as $c
+            | select($c.topic != null and $c.topic.commit != ($c.topic.pin.commit // "")
+                and $c.topic.commit != $s.commit)
+            | ($c.requests // [] | map(select(.from == $self))[0].revision // $s.commit[0:7]) as $built
+            | "\($s.directory)@\($c.topic.branch) (built with \($built))"' | head -n1)
+    fi
+    if [ -n "$lacks" ]; then
+        if $allow_released && [[ $release =~ ^v[0-9]+- ]]; then
+            printf 'GITSCALE_DEMO_%s_TAG=%s\n' "$name" "$release"
+            printf 'GITSCALE_DEMO_%s_LACKS=%s\n' "$name" "${lacks%% (*}"
+        else
+            printf '%s: lacks %s; join it, or --allow-released\n' "$label" "$lacks" >&2
+            failed=1
+        fi
+        continue
+    fi
+    printf 'GITSCALE_DEMO_%s_TAG=%s\n' "$name" "$(jq -r '.[0].hash' <<<"$hashed")"
+done
+exit "$failed"
