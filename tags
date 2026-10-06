@@ -9,8 +9,8 @@
 #
 #   GITSCALE_DEMO_<NAME>_LACKS=<checkout>@<topic>
 #
-# On a pinned branch, a repository's resolved release. On a topic, its source
-# hash: the image its own pipeline built of exactly these sources. A
+# A repository at its pin gets its resolved release; one on the topic, its
+# source hash: the image its own pipeline built of exactly these sources. A
 # repository not on the topic, whose dependency is on it with changes, has no
 # image with them: that fails, unless --allow-released.
 set -euo pipefail
@@ -101,6 +101,13 @@ for dir in "${dirs[@]}"; do
             printf '%s: lacks %s; join it, or --allow-released\n' "$label" "$lacks" >&2
             failed=1
         fi
+        continue
+    fi
+    # At its pin and lacking nothing, its release: the image its hash names,
+    # by the version a person reads.
+    if [ "$rel" != . ] && [ "$(jq -r '.topic == null' <<<"$entry")" = true ] &&
+        [[ $release =~ ^v[0-9]+- ]]; then
+        printf 'GITSCALE_DEMO_%s_TAG=%s\n' "$name" "$release"
         continue
     fi
     printf 'GITSCALE_DEMO_%s_TAG=%s\n' "$name" "$(jq -r '.[0].hash' <<<"$hashed")"
